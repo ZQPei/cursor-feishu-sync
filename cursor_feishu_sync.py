@@ -17,16 +17,19 @@ Cursor Dashboard → 飞书签名 动态同步脚本
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
+import platform
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, quote
 
 import httpx
 
@@ -44,6 +47,48 @@ SYNC_STATE_FILE = STATE_DIR / "sync_state.json"
 
 CURSOR_BASE = "https://cursor.com"
 LARK_SLOT_API = "https://l.garyyang.work/api/slot/update"
+
+
+def _read_cursor_ide_cookie() -> Optional[str]:
+    """从 Cursor IDE 本地数据库读取 accessToken 并拼成 web cookie 格式。
+    Cursor 每次启动时自动刷新 token，所以只要你在用 Cursor，token 就不会过期。"""
+    if platform.system() == "Darwin":
+        db_path = Path.home() / "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+    elif platform.system() == "Linux":
+        db_path = Path.home() / ".config/Cursor/User/globalStorage/state.vscdb"
+    else:
+        db_path = Path.home() / "AppData/Roaming/Cursor/User/globalStorage/state.vscdb"
+
+    if not db_path.exists():
+        return None
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+
+        token = row[0]
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        data = json.loads(base64.b64decode(payload))
+        user_id = data["sub"].split("|")[1]
+
+        cookie = f"{quote(user_id, safe='')}%3A%3A{token}"
+        exp_ts = data.get("exp", 0)
+        if exp_ts:
+            remaining = exp_ts - time.time()
+            if remaining < 0:
+                log.warning("Cursor IDE token 已过期，请重新打开 Cursor")
+                return None
+            log.info("  从 Cursor IDE 读取 token (剩余 %d 天)", remaining / 86400)
+        return cookie
+    except Exception as e:
+        log.debug("读取 Cursor IDE token 失败: %s", e)
+        return None
 
 
 def _compact(n: int) -> str:
@@ -86,7 +131,7 @@ class Config:
 
     @staticmethod
     def load() -> "Config":
-        """优先从环境变量加载，其次从 config.json。"""
+        """加载优先级: 环境变量 > config.json > Cursor IDE 本地 token。"""
         env_cookie = os.environ.get("CURSOR_COOKIE", "")
         env_cred = os.environ.get("LARK_CREDENTIAL", "")
         env_slot = os.environ.get("LARK_SLOT_ID", "")
@@ -98,14 +143,22 @@ class Config:
                 lark_slot_id=env_slot,
             )
 
+        file_cookie = ""
+        file_cred = ""
+        file_slot = ""
         if CONFIG_FILE.exists():
             d = json.loads(CONFIG_FILE.read_text())
-            return Config(
-                cursor_cookie=d.get("cursor_cookie", ""),
-                lark_credential=d.get("lark_credential", ""),
-                lark_slot_id=d.get("lark_slot_id", ""),
-            )
-        return Config()
+            file_cookie = d.get("cursor_cookie", "")
+            file_cred = d.get("lark_credential", "")
+            file_slot = d.get("lark_slot_id", "")
+
+        cookie = file_cookie or _read_cursor_ide_cookie() or ""
+
+        return Config(
+            cursor_cookie=cookie,
+            lark_credential=file_cred,
+            lark_slot_id=file_slot,
+        )
 
     def save(self):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
