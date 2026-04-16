@@ -1,0 +1,25 @@
+name: Sync Cursor → Feishu
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 每小时整点
+  workflow_dispatch:       # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install httpx
+
+      - name: Sync
+        env:
+          CURSOR_COOKIE: ${{ secrets.CURSOR_COOKIE }}
+          LARK_CREDENTIAL: ${{ secrets.LARK_CREDENTIAL }}
+          LARK_SLOT_ID: ${{ secrets.LARK_SLOT_ID }}
+        run: python cursor_feishu_sync.py --once
