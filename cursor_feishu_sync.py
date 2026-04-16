@@ -114,8 +114,8 @@ class CursorStats:
     tokens: int = 0
 
     def format_signature(self) -> str:
-        """精简签名：已蹬17.2K行 #377 · 362req · 277M tok"""
-        parts = [f"已蹬{_compact(self.agent_lines)}行 #{self.rank}"]
+        """精简签名：本月已蹬17.2K行 #377 · 362req · 277M tok"""
+        parts = [f"本月已蹬{_compact(self.agent_lines)}行 #{self.rank}"]
         if self.requests_limit > 0:
             parts.append(f"{self.requests_used}/{self.requests_limit}req")
         if self.tokens > 0:
