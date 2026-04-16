@@ -1,4 +1,4 @@
-name: Sync Cursor → Feishu
+name: Sync Cursor to Feishu
 
 on:
   schedule:
