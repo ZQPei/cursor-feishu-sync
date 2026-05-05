@@ -103,24 +103,29 @@ def _compact(n: int) -> str:
     return str(n)
 
 
+def _format_dollars(cents: int) -> str:
+    dollars = cents / 100
+    if dollars.is_integer():
+        return str(int(dollars))
+    return f"{dollars:.2f}".rstrip("0").rstrip(".")
+
+
 @dataclass
 class CursorStats:
     agent_lines: int
-    rank: int
-    total_users: int
     display_name: str
-    requests_used: int = 0
-    requests_limit: int = 0
-    tokens: int = 0
+    rank: int = 0
+    total_users: int = 0
+    monthly_usage_cents: int = 0
+    monthly_limit_cents: int = 0
 
     def format_signature(self) -> str:
-        """精简签名：本月已蹬17.2K行 #377 · 362req · 277M tok"""
-        parts = [f"本月已蹬{_compact(self.agent_lines)}行 #{self.rank}"]
-        if self.requests_limit > 0:
-            parts.append(f"{self.requests_used}/{self.requests_limit}req")
-        if self.tokens > 0:
-            parts.append(f"{_compact(self.tokens)} tok")
-        return " · ".join(parts)
+        """精简签名：本月已蹬17.2K行 0.59/2000$"""
+        if self.monthly_limit_cents > 0:
+            usage = _format_dollars(self.monthly_usage_cents)
+            limit = _format_dollars(self.monthly_limit_cents)
+            return f"本月已蹬{_compact(self.agent_lines)}行 {usage}/{limit}$"
+        return f"本月已蹬{_compact(self.agent_lines)}行"
 
 
 @dataclass
@@ -248,37 +253,80 @@ async def _get_leaderboard(
     return resp.json()
 
 
-async def _get_usage(
-    client: httpx.AsyncClient, cookie: str, user_id: str,
+async def _get_current_user(client: httpx.AsyncClient, cookie: str) -> Optional[dict]:
+    resp = await client.get(
+        f"{CURSOR_BASE}/api/auth/me",
+        headers=_cursor_headers(cookie),
+    )
+    if resp.status_code == 401:
+        log.error("Cookie 已过期")
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _get_composer_lines(
+    client: httpx.AsyncClient,
+    cookie: str,
+    team_id: int,
+    user_id: int,
+    start_date: str,
+    end_date: str,
+) -> int:
+    """获取个人本月 Agent Lines，来源于 analytics composer timeseries。"""
+    resp = await client.get(
+        f"{CURSOR_BASE}/api/v2/analytics/team/composer",
+        headers=_cursor_headers(cookie),
+        params={
+            "startDate": start_date,
+            "endDate": end_date,
+            "teamId": str(team_id),
+            "c": str(user_id),
+        },
+    )
+    if resp.status_code == 401:
+        log.error("Cookie 已过期")
+        return 0
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    return sum(row.get("total_lines_accepted", 0) for row in data)
+
+
+async def _get_monthly_usage(
+    client: httpx.AsyncClient, cookie: str,
 ) -> dict:
-    """返回 {requests_used, requests_limit, tokens}。"""
+    """返回 Monthly Usage 费用，单位为美分。"""
     try:
         resp = await client.get(
-            f"{CURSOR_BASE}/api/usage",
+            f"{CURSOR_BASE}/api/usage-summary",
             headers=_cursor_headers(cookie),
-            params={"user": user_id},
         )
         resp.raise_for_status()
         data = resp.json()
-        gpt4 = data.get("gpt-4", {})
+        overall = data.get("individualUsage", {}).get("overall", {})
         return {
-            "requests_used": gpt4.get("numRequests", 0),
-            "requests_limit": gpt4.get("maxRequestUsage", 0),
-            "tokens": gpt4.get("numTokens", 0),
+            "monthly_usage_cents": overall.get("used", 0),
+            "monthly_limit_cents": overall.get("limit", 0),
         }
     except Exception as e:
-        log.warning("获取用量失败: %s", e)
-        return {"requests_used": 0, "requests_limit": 0, "tokens": 0}
+        log.warning("获取 monthly usage 失败: %s", e)
+        return {"monthly_usage_cents": 0, "monthly_limit_cents": 0}
 
 
 async def fetch_cursor_stats(cookie: str) -> Optional[CursorStats]:
     log.info("正在获取 Cursor 数据...")
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        team_info = await _get_team_info(client, cookie)
+        team_info, current_user = await asyncio.gather(
+            _get_team_info(client, cookie),
+            _get_current_user(client, cookie),
+        )
         if not team_info:
+            return None
+        if not current_user:
             return None
 
         team_id = team_info["team_id"]
+        user_id = current_user["id"]
         billing_start_ms = team_info["billing_start_ms"]
 
         if billing_start_ms > 0:
@@ -288,37 +336,23 @@ async def fetch_cursor_stats(cookie: str) -> Optional[CursorStats]:
             start_date = date.today().replace(day=1).isoformat()
 
         end_date = date.today().isoformat()
-        user_id = _extract_user_id(cookie)
         log.info("  周期: %s ~ %s", start_date, end_date)
 
-        lb_data, usage = await asyncio.gather(
-            _get_leaderboard(client, cookie, team_id, start_date, end_date),
-            _get_usage(client, cookie, user_id),
+        agent_lines, usage = await asyncio.gather(
+            _get_composer_lines(client, cookie, team_id, user_id, start_date, end_date),
+            _get_monthly_usage(client, cookie),
         )
-        if not lb_data:
-            return None
-
-        lb = lb_data.get("composer_leaderboard", {})
-        entries = lb.get("data", [])
-        if not entries:
-            log.error("leaderboard 数据为空")
-            return None
-
-        me = entries[-1]
         stats = CursorStats(
-            agent_lines=me.get("total_composer_lines_accepted", 0),
-            rank=me.get("rank", 0),
-            total_users=lb.get("total_users", 0),
-            display_name=me.get("display_name", me.get("email", "unknown")),
-            requests_used=usage["requests_used"],
-            requests_limit=usage["requests_limit"],
-            tokens=usage["tokens"],
+            agent_lines=agent_lines,
+            display_name=current_user.get("name", current_user.get("email", "unknown")),
+            monthly_usage_cents=usage["monthly_usage_cents"],
+            monthly_limit_cents=usage["monthly_limit_cents"],
         )
-        log.info("  %s | Lines %s #%d/%d | %d/%d req | %s tok",
+        log.info("  %s | Lines %s | Monthly Usage $%s/$%s",
                  stats.display_name,
-                 f"{stats.agent_lines:,}", stats.rank, stats.total_users,
-                 stats.requests_used, stats.requests_limit,
-                 _compact(stats.tokens))
+                 f"{stats.agent_lines:,}",
+                 _format_dollars(stats.monthly_usage_cents),
+                 _format_dollars(stats.monthly_limit_cents))
         return stats
 
 
