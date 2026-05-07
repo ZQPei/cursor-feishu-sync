@@ -110,22 +110,21 @@ def _format_dollars(cents: int) -> str:
     return f"{dollars:.2f}".rstrip("0").rstrip(".")
 
 
+def _format_billions(tokens: int) -> str:
+    return f"{tokens / 1_000_000_000:.2f}B"
+
+
 @dataclass
 class CursorStats:
-    agent_lines: int
     display_name: str
-    rank: int = 0
-    total_users: int = 0
+    monthly_tokens: int = 0
     monthly_usage_cents: int = 0
     monthly_limit_cents: int = 0
 
     def format_signature(self) -> str:
-        """精简签名：本月已蹬17.2K行 0.59/2000$"""
-        if self.monthly_limit_cents > 0:
-            usage = _format_dollars(self.monthly_usage_cents)
-            limit = _format_dollars(self.monthly_limit_cents)
-            return f"本月已蹬{_compact(self.agent_lines)}行 {usage}/{limit}$"
-        return f"本月已蹬{_compact(self.agent_lines)}行"
+        """精简签名：本月 0.03B/35.6$"""
+        usage = _format_dollars(self.monthly_usage_cents)
+        return f"本月 {_format_billions(self.monthly_tokens)}/{usage}$"
 
 
 @dataclass
@@ -313,6 +312,41 @@ async def _get_monthly_usage(
         return {"monthly_usage_cents": 0, "monthly_limit_cents": 0}
 
 
+async def _get_monthly_tokens(
+    client: httpx.AsyncClient,
+    cookie: str,
+    team_id: int,
+    user_id: int,
+) -> int:
+    """获取本月 token 总量，来源于 Usage 页的 daily spend API。"""
+    now = datetime.now()
+    period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    period_end = now.replace(hour=23, minute=59, second=59, microsecond=999_000)
+    try:
+        resp = await client.post(
+            f"{CURSOR_BASE}/api/dashboard/get-daily-spend-by-category",
+            headers={
+                **_cursor_headers(cookie),
+                "Content-Type": "application/json",
+                "Origin": CURSOR_BASE,
+            },
+            json={
+                "teamId": team_id,
+                "userId": user_id,
+                "periodStartMs": int(period_start.timestamp() * 1000),
+                "periodEndMs": int(period_end.timestamp() * 1000),
+                "groupBy": 1,
+                "spendType": 1,
+            },
+        )
+        resp.raise_for_status()
+        daily_spend = resp.json().get("dailySpend", [])
+        return sum(int(row.get("totalTokens") or 0) for row in daily_spend)
+    except Exception as e:
+        log.warning("获取 monthly token 失败: %s", e)
+        return 0
+
+
 async def fetch_cursor_stats(cookie: str) -> Optional[CursorStats]:
     log.info("正在获取 Cursor 数据...")
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -338,19 +372,19 @@ async def fetch_cursor_stats(cookie: str) -> Optional[CursorStats]:
         end_date = date.today().isoformat()
         log.info("  周期: %s ~ %s", start_date, end_date)
 
-        agent_lines, usage = await asyncio.gather(
-            _get_composer_lines(client, cookie, team_id, user_id, start_date, end_date),
+        monthly_tokens, usage = await asyncio.gather(
+            _get_monthly_tokens(client, cookie, team_id, user_id),
             _get_monthly_usage(client, cookie),
         )
         stats = CursorStats(
-            agent_lines=agent_lines,
             display_name=current_user.get("name", current_user.get("email", "unknown")),
+            monthly_tokens=monthly_tokens,
             monthly_usage_cents=usage["monthly_usage_cents"],
             monthly_limit_cents=usage["monthly_limit_cents"],
         )
-        log.info("  %s | Lines %s | Monthly Usage $%s/$%s",
+        log.info("  %s | Tokens %s | Monthly Usage $%s/$%s",
                  stats.display_name,
-                 f"{stats.agent_lines:,}",
+                 f"{stats.monthly_tokens:,}",
                  _format_dollars(stats.monthly_usage_cents),
                  _format_dollars(stats.monthly_limit_cents))
         return stats
